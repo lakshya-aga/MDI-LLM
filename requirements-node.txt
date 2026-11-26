@@ -1,0 +1,11 @@
+# Minimal dependencies for a *secondary* (worker) node, e.g. an Android phone in
+# Termux. Secondary nodes receive their model chunk from the starter and never load
+# the tokenizer, training data or plotting code.
+# torch (and numpy) should come from the platform's package manager on Android:
+#   pkg install python-torch python-numpy
+torch
+numpy
+cherrypy
+requests
+pyyaml
+typing_extensions

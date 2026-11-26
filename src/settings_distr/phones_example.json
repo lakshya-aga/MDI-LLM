@@ -1,0 +1,40 @@
+{
+  "nodes": {
+    "starter": {
+      "addr": "192.168.1.10",
+      "communication": {
+        "port": 8088
+      },
+      "inference": {
+        "port_in": 5088,
+        "port_out": 5089
+      }
+    },
+    "secondary": [
+      {
+        "addr": "192.168.1.21",
+        "communication": {
+          "starter_addr": "192.168.1.10",
+          "port": 8089
+        },
+        "inference": {
+          "port_in": 5090,
+          "port_out": 5091
+        },
+        "device": "cpu"
+      },
+      {
+        "addr": "192.168.1.22",
+        "communication": {
+          "starter_addr": "192.168.1.10",
+          "port": 8090
+        },
+        "inference": {
+          "port_in": 5092,
+          "port_out": 5093
+        },
+        "device": "cpu"
+      }
+    ]
+  }
+}

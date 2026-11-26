@@ -58,6 +58,8 @@ def main(args):
         model_seq_length=args.sequence_length,
         verb=args.verb,
         plots=args.plots,
+        temperature=args.temperature,
+        top_k=args.top_k,
     )
 
     # Operation (start now includes loop)
@@ -191,6 +193,19 @@ if __name__ == "__main__":
         type=Path,
         help="""optional path of the file where to store the run information and generation
         time""",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="sampling temperature (default: TEMPERATURE in sub/config.py)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="""sample among the k most likely tokens (default: TOP_K in sub/config.py);
+        use 1 for greedy (deterministic) decoding""",
     )
     parser.add_argument("--seed", type=int, default=10137, help="set random seed")
     args = parser.parse_args()

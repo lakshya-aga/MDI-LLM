@@ -31,13 +31,11 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
-import accelerate
 import cherrypy as cp
 import torch
 
 from sub.config import DEVICE as DEFAULT_DEVICE
-from sub.config import (DTYPE, DTYPE_TORCH_MAPPING, N_LAYERS_NODES,
-                        TEMPERATURE, TOP_K)
+from sub.config import DTYPE_TORCH_MAPPING, N_LAYERS_NODES, TEMPERATURE, TOP_K
 from sub.connections import InputNodeConnection, OutputNodeConnection
 from sub.model import Config, KVCache, sample
 from sub.prompts import (PromptStyle, get_user_prompt, has_prompt_style,
@@ -45,9 +43,8 @@ from sub.prompts import (PromptStyle, get_user_prompt, has_prompt_style,
 from sub.submodels import SecondaryNode, StarterNode
 from sub.tokenizer import Tokenizer
 from sub.typing import FileType
-from sub.utils import (catch_loop_errors, count_transformer_blocks,
-                       detect_stop_tokens, find_eot, load_sd,
-                       plot_tokens_per_time, waiting_animation)
+from sub.utils import (catch_loop_errors, detect_stop_tokens, find_eot,
+                       waiting_animation)
 
 # -------------------------------------------------------------------------------------
 
@@ -196,17 +193,16 @@ class GPTServer:
             self.max_seq_length = None
 
         self.compile = False if "compile" not in kwargs else kwargs["compile"]
-        self.use_default_dtype = dtype is None
-        self.dtype = dtype if dtype else DTYPE  # Default
-        self.ptdtype = DTYPE_TORCH_MAPPING[self.dtype]
-        if not self.use_default_dtype:
+        # Sampling settings (only used by the starter); top_k=1 = greedy
+        if kwargs.get("temperature") is not None:
+            self.temperature = float(kwargs["temperature"])
+        if kwargs.get("top_k") is not None:
+            self.top_k = int(kwargs["top_k"])
+        # The actual dtype is resolved once the device is known (`_resolve_dtype`)
+        self.dtype = dtype
+        self.ptdtype: Optional[torch.dtype] = None
+        if dtype is not None:
             print(f"Overriding dtype to: {self.dtype}")
-        if self.dtype == "bfloat16" and (
-            not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()
-        ):
-            raise ValueError(
-                "Specified bfloat16, but the host does not support this format"
-            )
 
         self.node_type = node_type
         self.node_config = node_config
@@ -241,6 +237,7 @@ class GPTServer:
             self.own_config = node_config["nodes"]["starter"]
 
             self._select_device(model_device)
+            self._resolve_dtype()
 
             self.n_nodes = 1 + (
                 0
@@ -314,6 +311,7 @@ class GPTServer:
             )
             self.starter_addr = self.own_config["communication"]["starter_addr"]
             self._select_device(model_device)
+            self._resolve_dtype()
             # NOTE: the model will be initialized once config info is received (POST)
 
         # Init own info
@@ -338,6 +336,12 @@ class GPTServer:
         cp.tree.mount(self, "/", self.webserv_config)
         cp.config.update(
             {
+                # Production mode: no autoreloader thread polling the source files
+                # (wasted CPU/memory on small devices, and it restarts the node when a
+                # file changes) and no tracebacks in HTTP responses
+                "environment": "production",
+                "engine.autoreload.on": False,
+                "log.screen": True,  # keep errors visible (production disables it)
                 "server.socket_host": self.own_addr,
                 "server.socket_port": self.own_comm_port,
                 "server.thread_pool": 8,
@@ -646,41 +650,43 @@ class GPTServer:
                 "At least one between model_path and model_parameters must be nonempty"
             )
 
-        # TODO:
-        # 1. load empty model
-        # 2. load weights from disk
-        # 3. if the dtype was overridden, cast weights
-        # 4. load parameters to model
+        # 1. Build the model skeleton on "meta": no memory is allocated for weights, so
+        #    the only copy of the parameters that ever exists is the loaded one
         if VERB:
             print("Initializing empty local model")
-
         Model_class = StarterNode if "starter" in self.node_type else SecondaryNode
         try:
-            self.model = Model_class(self.model_config, n_transf_layers).to_empty(
-                device=self.model_device
-            )
-        except:
-            with accelerate.init_empty_weights():
-                self.model = Model_class(self.model_config, n_transf_layers).to("meta")
+            with torch.device("meta"):
+                self.model = Model_class(self.model_config, n_transf_layers)
+        except (AttributeError, TypeError):  # torch < 2.0: no device context manager
+            import accelerate
 
-        if VERB:
-            print("Loading parameters")
-            print(f"Using dtype {self.ptdtype}")
+            with accelerate.init_empty_weights(include_buffers=True):
+                self.model = Model_class(self.model_config, n_transf_layers)
 
-        # TODO: switch to "empty" models (torch >= 2.0)
+        # 2. Get the weights - memory-mapped from disk if possible, so that pages are
+        #    backed by the file instead of a second in-RAM copy
         if model_path:
-            # NOTE: using accelerate to prevent memory usage spike at the beginning
-            # resulting from the need to load both the "empty" model and the weights
-            self.model = accelerate.load_checkpoint_and_dispatch(
-                self.model, str(model_path), dtype=self.ptdtype
+            if VERB:
+                print(f"Loading parameters from {model_path}")
+            model_parameters = self._load_chunk(model_path)
+        assert model_parameters is not None
+
+        # 3. Cast/move each tensor in place (the original is freed as we go), then
+        #    assign them to the skeleton without copying
+        if VERB:
+            print(f"Using dtype {self.ptdtype} on {self.torch_model_device}")
+        for k in list(model_parameters.keys()):
+            model_parameters[k] = model_parameters[k].to(
+                device=self.torch_model_device, dtype=self.ptdtype
             )
-        else:
-            # NOTE: if here, cannot use accelerate! Weights are already in memory...
-            model_parameters = {
-                k: v.to(self.ptdtype) for k, v in model_parameters.items()
-            }
-            self.model.load_weights(model_parameters)
-            self.model = self.model.to(self.ptdtype)
+        self.model.load_weights(model_parameters)
+
+        # 4. Non-persistent buffers (RoPE cos/sin) are not in the state dict: compute
+        #    them on the target device (kept in float32; `apply_rope` casts the output)
+        self.model.cos, self.model.sin = self.model.rope_cache(
+            device=self.torch_model_device
+        )
 
         if self.max_seq_length:
             print(f"[DEBUG] Truncating context length to {self.max_seq_length}")
@@ -688,10 +694,6 @@ class GPTServer:
         else:
             # Use default value
             self.max_seq_length = self.model.max_seq_length
-
-        if VERB:
-            print(f"Moving model to {self.torch_model_device}")
-        self.model = self.model.to(self.torch_model_device)
 
         if self.compile and hasattr(torch, "compile"):
             if VERB:
@@ -712,6 +714,58 @@ class GPTServer:
         del model_parameters
         model_parameters = None
         gc.collect()
+
+    @staticmethod
+    def _load_chunk(path: Path) -> Dict[str, torch.Tensor]:
+        """
+        Load a model chunk (state dict) on CPU, memory-mapping the file when the
+        installed torch supports it (>= 2.1).
+        """
+        try:
+            return torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+        except TypeError:  # older torch: no `mmap`/`weights_only` arguments
+            return torch.load(path, map_location="cpu")
+
+    def _resolve_dtype(self):
+        """
+        Pick the model dtype for this node's device, unless one was given explicitly.
+
+        Defaults: CUDA -> bfloat16 if supported, else float16; MPS -> float16;
+        CPU -> float32 (float16 matmuls are missing or very slow on CPU in the torch
+        versions this repo supports, e.g. phones running Termux).
+        """
+        dev = self.torch_model_device.type
+        if self.dtype is None:
+            if dev == "cuda":
+                self.dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+            elif dev == "mps":
+                self.dtype = "float16"
+            else:
+                self.dtype = "float32"
+        if self.dtype == "bfloat16" and dev == "cuda" and not torch.cuda.is_bf16_supported():
+            raise ValueError("Specified bfloat16, but this GPU does not support it")
+        if self.dtype == "bfloat16" and dev == "mps":
+            raise ValueError("bfloat16 is not supported on MPS")
+        self.ptdtype = DTYPE_TORCH_MAPPING[self.dtype]
+        if VERB:
+            print(f"Using dtype: {self.dtype}")
+
+    def _autocast_ctx(self):
+        """Autocast context for the processing loops (no-op where it doesn't apply)."""
+        dev = self.torch_model_device.type
+        if dev == "mps" or self.ptdtype == torch.float32:
+            return nullcontext()
+        return torch.amp.autocast(device_type=dev, dtype=self.ptdtype)
+
+    def _to_local(self, data: torch.Tensor) -> torch.Tensor:
+        """
+        Move received data to this node's device; activations (floating point) are
+        also cast to the local dtype, so nodes with different dtypes can be chained
+        (e.g., a float16 laptop GPU and float32 phone CPUs). Token IDs are left as is.
+        """
+        if data.is_floating_point():
+            return data.to(device=self.torch_model_device, dtype=self.ptdtype)
+        return data.to(self.torch_model_device)
 
     def _load_tokenizer(self, tokenizer_dir: FileType):
         """
@@ -821,17 +875,7 @@ class GPTServer:
             )
         self.n_samples = n_samples
 
-        if "cuda" in self.model_device:
-            device_type = "cuda"
-        elif "mps" in self.model_device:
-            device_type = "mps"
-        else:
-            device_type = "cpu"
-        ctx = (  # Use autocast if on cuda or cpu (MPS not supported yet)
-            nullcontext()
-            if device_type == "mps"
-            else torch.amp.autocast(device_type=device_type, dtype=self.ptdtype)
-        )
+        ctx = self._autocast_ctx()
 
         # <<<< TODO: replace - analogous operations to be executed in POST from user
         # The POST should
@@ -901,8 +945,8 @@ class GPTServer:
 
         start_time = time.time()
         n_tokens = 0
-        if PLOTS:
-            self.tok_time.append((0, 0))
+        # Always recorded: the caller reports the total generation time from it
+        self.tok_time.append((0, 0))
 
         print("[INFO] Launching processing loop")
         loading_thread.start()
@@ -921,12 +965,11 @@ class GPTServer:
                         self.running.clear()  # TODO: remove
                     else:
                         sample_id = in_msg["sample_index"]
-                        idx = in_msg["data"].to(self.model_device)
+                        idx = self._to_local(in_msg["data"])
                         stopping_detected = False
 
                         # Keep variable iter_ind[i] for each sample i
                         if self.iter_ind[sample_id] >= 1:
-                            print("OUTPUT")
                             # We are not in the first iteration for this sample
                             # --> Can start processing messages from last secondary node
                             logits = self.model(idx, first_pass=False)
@@ -950,10 +993,7 @@ class GPTServer:
 
                             # Only add new token after it has been generated
                             n_tokens += 1
-                            if PLOTS:
-                                self.tok_time.append(
-                                    (n_tokens, time.time() - start_time)
-                                )
+                            self.tok_time.append((n_tokens, time.time() - start_time))
 
                         else:
                             # First iteration for the current sample!
@@ -1030,18 +1070,7 @@ class GPTServer:
         assert self.n_samples is not None
         assert self.model_device is not None
 
-        # Should be overrided by kwargs
-        if "cuda" in self.model_device:
-            device_type = "cuda"
-        elif "mps" in self.model_device:
-            device_type = "mps"
-        else:
-            device_type = "cpu"
-        ctx = (  # Use autocast if on cuda or cpu (MPS not supported yet)
-            nullcontext()
-            if device_type == "mps"
-            else torch.amp.autocast(device_type=device_type, dtype=self.ptdtype)
-        )
+        ctx = self._autocast_ctx()
 
         # Allow node to be 100% agnostic of the system! If it receives a sample with a
         # new ID, it will initialize the caches for that sample on the fly!
@@ -1079,7 +1108,7 @@ class GPTServer:
                         if iter >= self.n_samples:
                             first_glob_iter = False
 
-                        idx = in_msg["data"].to(self.torch_model_device)
+                        idx = self._to_local(in_msg["data"])
                         if sample_id not in self.T_i:
                             assert (
                                 first_glob_iter
@@ -1119,6 +1148,13 @@ class GPTServer:
         """
         if len(path) == 0:
             return json.dumps(self.node_config)
+        if path[0] == "status":
+            # Lets the starter decide whether this node needs its weights sent over HTTP
+            has_chunk = self.model_path is not None and Path(self.model_path).is_file()
+            return json.dumps(
+                {"role": self.role, "has_chunk": has_chunk, "initialized": self.model is not None}
+            )
+        raise cp.HTTPError(404, "Not found")
 
     def POST(self, *path, **params):
         """

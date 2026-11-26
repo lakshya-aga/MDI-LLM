@@ -61,8 +61,11 @@ Make sure the devices can "see" each other over the network.\
 possible to specify a different torch device as a command line argument.
 It is also possible to select the device for each node through the
 configuration file (JSON) by adding the `"device"` key to the node information.\
-**Note (2):** the data type used will be bfloat16 when available, else float16,
-but can be overridden from the command line (`--dtype`).
+**Note (2):** the default data type depends on each node's device: bfloat16 on GPUs
+that support it (else float16), float16 on MPS, float32 on CPU. It can be overridden
+from the command line (`--dtype`); nodes with different data types can be mixed.\
+**Note (3):** to run nodes on Android phones (Termux), see
+[docs/setup-android.md](docs/setup-android.md).
 
 First, download the model and convert it to the litGPT format (note: to access
 the weights, it is required to accept the license agreement on HF and provide

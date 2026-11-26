@@ -10,17 +10,19 @@ import warnings
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple,
+                    Union)
 
 import torch
 import yaml
-from numpy.typing import NDArray
 from torch import nn
 
 from sub.config import (EVAL_ITERS, LEARNING_RATE, LR_DECAY_ITERS, MIN_LR,
                         N_LAYERS_NODES, WARMUP_ITERS)
 from sub.model import Config
-from sub.utils.data_loader import get_batch
+
+if TYPE_CHECKING:  # training-only dependency, kept off the inference nodes
+    from numpy.typing import NDArray
 
 VERB = False
 
@@ -60,8 +62,8 @@ def get_obj_size(obj):
 @torch.no_grad()  # Tell the program not to evaluate the gradients (no BP)
 def estimate_loss(
     model: nn.Module,
-    train: Union[torch.Tensor, NDArray],
-    val: Union[torch.Tensor, NDArray],
+    train: Union[torch.Tensor, "NDArray"],
+    val: Union[torch.Tensor, "NDArray"],
     batch_size: int,
     device: str,
     *args,
@@ -82,6 +84,9 @@ def estimate_loss(
             "train": mean loss over EVAL_ITERS iterations for training set
             "val": mean loss over EVAL_ITERS iterations for validation set
     """
+    # Imported here: the data loader needs numpy + tiktoken (training only)
+    from sub.utils.data_loader import get_batch
+
     ctx = kwargs.get("ctx", nullcontext())
 
     out = {}

@@ -281,9 +281,10 @@ class GPTDistributed:
         elif "secondary" in self.node_type:
             # FIXME: secondary node may be completely agnostic of the used model and
             # receive the model config (and the chunk) at initialization
-            assert (
-                self.ckpt_dir or self.chunk_path
-            ), "Need to specify at least 1 between the chunk path and the checkpoint directory"
+            if not (self.ckpt_dir or self.chunk_path) and VERB:
+                # The starter will send the model config and this node's weights in the
+                # initialization message (no files needed on this device)
+                print("No local chunk - expecting the weights from the starter node")
 
             # Can either pass "secondary:ind" or secondary_index=ind
             split_type = self.node_type.split(":")
@@ -451,9 +452,13 @@ class GPTDistributed:
             curr_msg["next_node"] = next
             curr_msg["max_seq_length"] = self.model_seq_length
 
-            if not self.model_was_split:
+            # Send the weights unless the node already has its chunk on disk (e.g.,
+            # phones started without --chunk always get their weights from here)
+            if not self.model_was_split or not self._node_has_chunk(sec_node):
                 chunk_path = node_chunks_dir / f"model_secondary{i}.pth"
-                curr_msg["params"] = torch.load(chunk_path, device="cpu")
+                if VERB:
+                    print(f"Sending weights to secondary node {i} ({chunk_path.name})")
+                curr_msg["params"] = torch.load(chunk_path, map_location="cpu")
 
             # Update next and prev for next iteration
             prev = sec_node
@@ -482,6 +487,24 @@ class GPTDistributed:
             logger_wp.info(f"Secondary node {i} was initialized successfully")
 
         return out
+
+    def _node_has_chunk(self, node: dict, max_tries: int = 60) -> bool:
+        """
+        Ask a secondary node (GET /status) whether it has its model chunk on disk.
+        Waits for the node to come up; nodes that don't expose /status (older
+        versions) are assumed to have their chunk, as before.
+        """
+        addr = f"http://{node['addr']}:{node['communication']['port']}/status"
+        for _ in range(max_tries):
+            try:
+                ret = requests.get(addr, timeout=5)
+            except requests.exceptions.RequestException:
+                time.sleep(2)
+                continue
+            if ret.status_code == 200:
+                return bool(ret.json().get("has_chunk", False))
+            return True
+        raise ConnectionError(f"Secondary node at {addr} is unreachable")
 
     def stop_nodes(self) -> int:
         """
@@ -529,7 +552,7 @@ class GPTDistributed:
             ret = req_func(
                 addr,
                 data=pickle.dumps(content),
-                timeout=100,
+                timeout=600,  # large chunks to slow (e.g., phone) nodes
             )
 
             if ret.status_code == 413:
