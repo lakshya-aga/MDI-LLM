@@ -698,12 +698,15 @@ class CausalSelfAttention(nn.Module):
         # Split batched computation into the three elements q, k, v
         q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
 
-        # Maybe repeat k and v if for the non multi-head attention cases
-        # training: flash attention requires it
-        # inference: multi-query would require a full kv cache so avoid it to limit its memory usage
-        if self.config.n_query_groups != self.config.n_head and (
-            input_pos is None or self.config.n_query_groups != 1
-        ):
+        # With a KV cache and GQA/MQA, keep k/v at `n_query_groups` heads: the cache then
+        # stores one copy per group instead of `q_per_kv` identical copies (8x smaller
+        # for TinyLlama), and attention is computed group-wise (see
+        # `_grouped_attention`), so the expanded tensors are never materialized.
+        grouped = input_pos is not None and self.config.n_query_groups != self.config.n_head
+
+        # Without a KV cache (training / no-cache inference), repeat k and v so that
+        # the standard (flash) attention kernels can be used.
+        if self.config.n_query_groups != self.config.n_head and not grouped:
             # If here: we are using GQA (n_query_groups != n_head) && either 'input_pos'
             # is None (no arange [0, T-1]) or no Single Query Attn. (n_query_groups !=1)
             k = k.expand(  # changes size of each dim to these:
@@ -728,7 +731,10 @@ class CausalSelfAttention(nn.Module):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
             k, v = self.kv_cache(input_pos, k, v)
 
-        y = self.scaled_dot_product_attention(q, k, v, mask)
+        if grouped:
+            y = self._grouped_attention(q, k, v, mask, q_per_kv)
+        else:
+            y = self.scaled_dot_product_attention(q, k, v, mask)
         # re-assemble all head outputs side by side
         y = y.reshape(B, T, self.config.head_size * self.config.n_head)
 
@@ -750,6 +756,44 @@ class CausalSelfAttention(nn.Module):
         )
         return y.transpose(1, 2)
 
+    def _grouped_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        q_per_kv: int,
+    ) -> torch.Tensor:
+        """
+        Attention for GQA/MQA when k and v hold only `n_query_groups` heads.
+
+        The `q_per_kv` query heads of each group are folded into the sequence
+        dimension, so every group attends to its single (shared) k/v head without
+        copying k/v. Query heads are laid out group-major (head h belongs to group
+        h // q_per_kv), matching how `qkv` is split in `forward`.
+
+        Args:
+            q: (B, n_head, T, hs)
+            k, v: (B, n_query_groups, S, hs)
+            mask: (1, 1, T, S) boolean mask, or None
+            q_per_kv: number of query heads per k/v group
+
+        Returns:
+            (B, T, n_head, hs), as `scaled_dot_product_attention`
+        """
+        B, _, T, hs = q.shape
+        G = self.config.n_query_groups
+        # (B, G, q_per_kv * T, hs): rows ordered as (query head in group, position)
+        q = q.reshape(B, G, q_per_kv * T, hs)
+        if mask is not None:
+            # Same causal mask for each query head of the group
+            mask = mask.repeat(1, 1, q_per_kv, 1)
+        y = self.working_scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=mask is None
+        )
+        # (B, G, q_per_kv, T, hs) -> (B, n_head, T, hs) -> (B, T, n_head, hs)
+        return y.reshape(B, G * q_per_kv, T, hs).transpose(1, 2)
+
     def build_kv_cache(
         self,
         batch_size: int,
@@ -761,7 +805,8 @@ class CausalSelfAttention(nn.Module):
         """
         Creates a KVCache object that can be used to cache previous K and V values.
         """
-        heads = 1 if self.config.n_query_groups == 1 else self.config.n_head
+        # k/v are cached before being expanded to all query heads (see `forward`)
+        heads = self.config.n_query_groups
         v_shape = (batch_size, heads, max_seq_length, self.config.head_size)
         if rope_cache_length is None:
             if self.config.rotary_percentage != 1.0:
