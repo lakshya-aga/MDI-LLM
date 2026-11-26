@@ -1,5 +1,4 @@
 import os
-import pickle
 import signal
 import socket
 import threading
@@ -7,7 +6,7 @@ import time
 from collections import deque
 from typing import Any, Dict, Optional, Tuple
 
-from .config import HEADERLENGTH
+from . import wire
 
 loopsigns = ["|", "/", "-", "\\"]
 
@@ -152,6 +151,9 @@ class InputNodeConnection(NodeConnection):
             else:
                 self.sock_to_prev_properties[0].close()
 
+        # Small frames (one token's activations): don't let Nagle delay them
+        self.sock_to_prev_properties[0].setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         if self.verb and connected:
             print("> Connection with previous node established!                     ")
 
@@ -185,33 +187,28 @@ class InputNodeConnection(NodeConnection):
 
     def run(self):
         """
-        Receive messages and place them in the input queue.
+        Receive messages (see `sub.wire` for the frame format) and place them in the
+        input queue.
         """
-        _n_recv_msg = 0
-
         while self.running.is_set():
-            # Receive information from the new socket (exact length)
-            msg = self.recv_msg(HEADERLENGTH)
-
-            # Extract message length from the header
-            try:
-                msg_len = int(msg[:HEADERLENGTH])
-            except ValueError:
+            head = self.recv_msg(wire.FRAME_HEADER.size)
+            if len(head) < wire.FRAME_HEADER.size:
                 self.running.clear()
                 break
-            _n_recv_msg += 1
-
-            # Read payload (exact size - this is important)
-            msg_payload = self.recv_msg(msg_len)
             try:
-                data = pickle.loads(msg_payload)
-            except EOFError:
-                # Here at the end of generation
-                # FIXME: maybe trigger shutdown by clearing self.running?
-                pass
-            else:
-                self.message_queue.append(data)
-                self.queue_not_empty.set()
+                flags, code, ndim, sample_index, size = wire.decode_frame_header(head)
+            except ValueError as e:
+                print(f"[THR] {e}")
+                self.running.clear()
+                break
+            shape_buf = self.recv_msg(4 * ndim)
+            payload = self.recv_msg(size)
+            if len(shape_buf) < 4 * ndim or len(payload) < size:
+                break  # connection closed mid-message
+            self.message_queue.append(
+                wire.frame_to_msg(flags, code, shape_buf, sample_index, payload)
+            )
+            self.queue_not_empty.set()
 
         if self.verb:
             print("[THR] Input queue thread stopped")
@@ -288,13 +285,18 @@ class OutputNodeConnection(NodeConnection):
         while not connected and tries < max_tries:
             try:
                 self.sock_to_next = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # Bind should work even after some fails
-                self.sock_to_next.bind(
-                    (
-                        self.config["addr"],
-                        self.config["inference"]["port_out"],
+                # Bind the configured local port on the first attempts; then let the OS
+                # pick one: right after a previous run the old connection on that port
+                # can sit in TIME_WAIT and make every connect() fail. The receiving
+                # node only checks the peer IP.
+                if tries < 2:
+                    self.sock_to_next.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self.sock_to_next.bind(
+                        (
+                            self.config["addr"],
+                            self.config["inference"]["port_out"],
+                        )
                     )
-                )
                 self.sock_to_next.connect(
                     (
                         self.next_node_info["addr"],
@@ -318,28 +320,21 @@ class OutputNodeConnection(NodeConnection):
 
         if not connected:
             raise ConnectionError("Unable to connect to next node!")
+        self.sock_to_next.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         if self.verb:
             print("> Connection with next node established!               ")
 
-    def send_msg(self, data: Any):
+    def send_msg(self, data: Dict[str, Any]):
         """
-        Send any Python object to the next node.
-        The sender is a **client**.
-
-        The `data` will be sent as raw bytes (pickled).
-
-        The message is composed by a header of HEADERLENGTH bytes including the length
-        of the actual message, plus a message of MSGLENGTH bytes containing the
-        zero-padded message.
+        Send one message ({"sample_index", "data", "stop"}) to the next node, encoded
+        as a binary frame (see `sub.wire`). The sender is a **client**.
         """
         assert self.sock_to_next is not None
-
-        message_str = pickle.dumps(data)
-        tx_msg = bytes(f"{len(message_str):<{HEADERLENGTH}}", "utf-8") + message_str
-        # NOTE: attempt at sending multiple messages in a "safe" way (no sendall)
-        while tx_msg:
-            tx_msg = tx_msg[self.sock_to_next.send(tx_msg) :]
+        tx_msg = wire.encode_frame(
+            int(data["sample_index"]), data.get("data"), bool(data.get("stop", False))
+        )
+        self.sock_to_next.sendall(tx_msg)
 
     def run(self):
         while self.running.is_set():

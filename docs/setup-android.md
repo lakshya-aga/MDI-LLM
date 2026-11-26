@@ -1,5 +1,9 @@
 # Running MDI-LLM across a laptop and Android phones
 
+> **Prefer the app:** [android-app.md](android-app.md) describes a native node (one APK,
+> no Termux or PyTorch, about half the memory). This page covers the Python node in
+> Termux. Steps 2–3 below (preparing the model, writing the config) apply to both.
+
 The laptop is the **starter** node: it holds the model files, the tokenizer, the
 first/last layers, and it sends every phone its share of the weights over HTTP. The
 phones are **secondary** nodes running in [Termux](https://termux.dev). They only need

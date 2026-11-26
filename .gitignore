@@ -224,3 +224,11 @@ img/
 
 # Personal notes
 personal_notes/
+
+# Android app / native node
+android/.gradle/
+android/local.properties
+android/.idea/
+android/**/.cxx/
+*.iml
+*.apk

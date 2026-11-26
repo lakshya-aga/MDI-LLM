@@ -21,7 +21,6 @@
 import json
 import logging
 import os
-import pickle
 import time
 import warnings
 from contextlib import nullcontext
@@ -34,6 +33,7 @@ import torch
 
 from sub import PromptStyle
 from sub.config import N_LAYERS_NODES
+from sub import wire
 from sub.gptserver import GPTServer
 from sub.typing import FileType
 from sub.utils import load_from_pt, split_and_store
@@ -408,7 +408,11 @@ class GPTDistributed:
         Information sent:
             - Node role ("role")
             - Model config (GPTConfig as dict) ("model_config")
-            - Model parameters ("params") - from pickle.dumps() - if not split before
+            - Model parameters ("params") - if the node has no chunk on disk
+
+        The body is a safetensors file (see `sub.wire`): the parameters are its
+        tensors and the other fields are in its metadata, so non-Python nodes can
+        parse it.
             - Previous node information - from json file ("prev_node")
             - Next node information - from json ("next_node")
 
@@ -458,7 +462,7 @@ class GPTDistributed:
                 chunk_path = node_chunks_dir / f"model_secondary{i}.pth"
                 if VERB:
                     print(f"Sending weights to secondary node {i} ({chunk_path.name})")
-                curr_msg["params"] = torch.load(chunk_path, map_location="cpu")
+                curr_msg["params"] = wire.load_chunk(chunk_path)
 
             # Update next and prev for next iteration
             prev = sec_node
@@ -474,7 +478,11 @@ class GPTDistributed:
             target_port = sec_node["communication"]["port"]
 
             addr = f"http://{target_addr}:{target_port}/init"
-            out *= self._request_to_node("post", addr, curr_msg)
+            params = curr_msg.pop("params", None)
+            body = wire.encode_safetensors(params, curr_msg)
+            del params
+            out *= self._request_to_node("post", addr, body)
+            del body
 
             if not out:
                 if VERB:
@@ -516,11 +524,11 @@ class GPTDistributed:
             target_port = sec_node["communication"]["port"]
 
             addr = f"http://{target_addr}:{target_port}/stop"
-            out *= self._request_to_node("put", addr, "")
+            out *= self._request_to_node("put", addr, b"")
         return out
 
     def _request_to_node(
-        self, req_type: str, addr: str, content: Any, max_n_requests: int = 100
+        self, req_type: str, addr: str, content: bytes, max_n_requests: int = 100
     ) -> int:
         """
         Send an HTTP request containing a json-formatted string to a specified
@@ -529,7 +537,7 @@ class GPTDistributed:
         Args:
             req_type: type of HTTP request, can be "post" or "put"
             addr: full address (http(s)://<ip>:<port>) of the target node
-            content: python dict containing the information
+            content: request body (already serialized)
             max_n_requests: maximum number of requests before failure
 
         Returns:
@@ -546,12 +554,13 @@ class GPTDistributed:
         n_ret = 0
         if VERB:
             print(f"Sending {req_type} request to {addr}")
-            print(f"Payload: {len(pickle.dumps(content))} Bytes")
+            print(f"Payload: {len(content)} Bytes")
         try:
             # Specify timeout
             ret = req_func(
                 addr,
-                data=pickle.dumps(content),
+                data=content,
+                headers={"Content-Type": "application/octet-stream"},
                 timeout=600,  # large chunks to slow (e.g., phone) nodes
             )
 
@@ -577,7 +586,8 @@ class GPTDistributed:
             try:
                 ret = req_func(
                     addr,
-                    data=pickle.dumps(content),
+                    data=content,
+                headers={"Content-Type": "application/octet-stream"},
                     timeout=10000,
                 )
                 logger_wp.debug(

@@ -64,8 +64,10 @@ configuration file (JSON) by adding the `"device"` key to the node information.\
 **Note (2):** the default data type depends on each node's device: bfloat16 on GPUs
 that support it (else float16), float16 on MPS, float32 on CPU. It can be overridden
 from the command line (`--dtype`); nodes with different data types can be mixed.\
-**Note (3):** to run nodes on Android phones (Termux), see
-[docs/setup-android.md](docs/setup-android.md).
+**Note (3):** to run nodes on Android phones, use the native app
+([docs/android-app.md](docs/android-app.md)), a C++ node with no Python or PyTorch on
+the phone, or Termux ([docs/setup-android.md](docs/setup-android.md)). Nodes exchange
+a language-neutral binary format ([docs/wire-format.md](docs/wire-format.md)).
 
 First, download the model and convert it to the litGPT format (note: to access
 the weights, it is required to accept the license agreement on HF and provide

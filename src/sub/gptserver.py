@@ -22,7 +22,6 @@ import gc
 import json
 import logging
 import os
-import pickle
 import threading
 import time
 import warnings
@@ -36,6 +35,7 @@ import torch
 
 from sub.config import DEVICE as DEFAULT_DEVICE
 from sub.config import DTYPE_TORCH_MAPPING, N_LAYERS_NODES, TEMPERATURE, TOP_K
+from sub import wire
 from sub.connections import InputNodeConnection, OutputNodeConnection
 from sub.model import Config, KVCache, sample
 from sub.prompts import (PromptStyle, get_user_prompt, has_prompt_style,
@@ -717,14 +717,8 @@ class GPTServer:
 
     @staticmethod
     def _load_chunk(path: Path) -> Dict[str, torch.Tensor]:
-        """
-        Load a model chunk (state dict) on CPU, memory-mapping the file when the
-        installed torch supports it (>= 2.1).
-        """
-        try:
-            return torch.load(path, map_location="cpu", mmap=True, weights_only=True)
-        except TypeError:  # older torch: no `mmap`/`weights_only` arguments
-            return torch.load(path, map_location="cpu")
+        """Load a model chunk (.safetensors or .pth) on CPU, memory-mapped if possible."""
+        return wire.load_chunk(path)
 
     def _resolve_dtype(self):
         """
@@ -1178,7 +1172,11 @@ class GPTServer:
         ) and self.model is None:  # Only for non-init nodes
             if len(path) > 0 and path[0] == "init":
                 assert not self.running.is_set()
-                init_msg = pickle.loads(cp.request.body.read())
+                # safetensors body: weights as tensors, the rest as metadata
+                params, init_msg = wire.decode_safetensors(cp.request.body.read())
+                if params:
+                    init_msg["params"] = params
+                del params
                 if self.node_type is None:
                     self.role = self.node_type = init_msg["role"]
                 self.prev_node = init_msg["prev_node"]
