@@ -23,22 +23,41 @@ ring.
 
 ## Build
 
-Requirements: Android Studio (or the command-line SDK) with **NDK** and **CMake
-3.22.1** installed from *SDK Manager → SDK Tools*.
+Requirements: JDK 17 and the Android SDK (platform 35). Gradle installs the NDK and
+build-tools it needs on the first build.
 
 - **Android Studio:** *Open* the `android/` folder, then *Build → Build APK(s)*.
-- **Command line:** `android/` has no Gradle wrapper jar. Generate it once with a local
-  Gradle (`cd android && gradle wrapper`), then run:
+- **Command line** (macOS with Homebrew; other systems are similar):
 
   ```bash
-  cd android && ./gradlew assembleRelease
+  brew install openjdk@17 && brew install --cask android-commandlinetools
+  export JAVA_HOME=$(brew --prefix openjdk@17) ANDROID_HOME=$(brew --prefix)/share/android-commandlinetools
+  yes | sdkmanager --licenses && sdkmanager "platforms;android-35" "platform-tools" "cmake;3.22.1"
+  cd android && echo "sdk.dir=$ANDROID_HOME" > local.properties && ./gradlew assembleRelease
   ```
 
-  The APK is `android/app/build/outputs/apk/release/app-release.apk`, signed with the
-  debug key so it can be sideloaded. Install it with
-  `adb install -r app-release.apk`, or copy it to the phone.
+  The APK (about 3 MB) is `android/app/build/outputs/apk/release/app-release.apk`. It is
+  signed with the debug key so it can be sideloaded: `adb install -r app-release.apk`,
+  or copy it to the phone and open it.
 
 The APK contains `arm64-v8a` (phones, NEON kernels) and `x86_64` (emulator) libraries.
+
+### Try it in the emulator first
+
+With an arm64 emulator running (`sdkmanager "emulator"
+"system-images;android-35;google_apis;arm64-v8a"`, then `avdmanager create avd`), use
+adb port forwarding so the whole ring runs on `127.0.0.1`:
+
+```bash
+adb install -r android/app/build/outputs/apk/release/app-release.apk
+adb forward tcp:8089 tcp:8089 && adb forward tcp:5090 tcp:5090   # starter -> node
+adb reverse tcp:5088 tcp:5088                                     # node -> starter
+```
+
+In the app, set the IP to `127.0.0.1`, keep the default ports, and tap **Start node**.
+Then run the starter with a nodes config that has one secondary at `127.0.0.1`
+(ports 8089/5090/5091). Run `adb forward --remove-all` afterwards; until then adb holds
+those ports on the laptop.
 
 ## Use
 
