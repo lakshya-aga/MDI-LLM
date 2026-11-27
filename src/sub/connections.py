@@ -112,6 +112,8 @@ class InputNodeConnection(NodeConnection):
         self.config = config
         self.prev_node_info = prev_node
         self.sock_to_prev = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Allow re-binding while connections of a previous run are in TIME_WAIT
+        self.sock_to_prev.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         failing = True
         tries = 0
         if self.verb:
