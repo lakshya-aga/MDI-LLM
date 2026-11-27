@@ -1,0 +1,14 @@
+{
+  "_note": "PLACEHOLDER numbers. Replace read_gbps with membw's median read, rtt_ms with link_bench's median RTT to the starter, and mem_gb with memory free for the model. Devices are in pipeline order; the first is the starter.",
+  "model": "llama-3.1-8b",
+  "weight_bits": 16,
+  "kv_bits": 16,
+  "context": 1024,
+  "samples": 1,
+  "devices": [
+    {"name": "mbp-m5", "read_gbps": 100.0, "mem_gb": 11.0, "rtt_ms": 0.0},
+    {"name": "mbp-m1", "read_gbps": 55.0, "mem_gb": 10.0, "rtt_ms": 4.0},
+    {"name": "pixel-11-pro", "read_gbps": 30.0, "mem_gb": 6.0, "rtt_ms": 6.0},
+    {"name": "nothing-2a", "read_gbps": 12.0, "mem_gb": 4.0, "rtt_ms": 8.0}
+  ]
+}
